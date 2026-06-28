@@ -1,0 +1,21 @@
+{
+  "name": "discreetblur-ffmpeg-service",
+  "version": "1.0.0",
+  "description": "Applies tracked region blur to images and videos using SAM2 mask data, preserving original quality.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "sharp": "^0.33.5",
+    "node-fetch": "^2.7.0",
+    "fluent-ffmpeg": "^2.1.3",
+    "uuid": "^9.0.1",
+    "dotenv": "^16.4.5"
+  }
+}
