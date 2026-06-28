@@ -8,10 +8,11 @@
  *
  * Design: this endpoint responds 202 Accepted immediately after validating
  * the request, then does the actual (slow) frame extraction / blur / re-encode
- * work in the background. When finished, it uploads the result to Supabase
- * Storage and PATCHes the jobs table directly. This matches the async/webhook
- * pattern the rest of the app (Supabase Edge Functions) expects, and avoids
- * any HTTP request timing out on a long video job.
+ * work in the background. When finished, it POSTs the finished file to a
+ * Supabase Edge Function (CALLBACK_URL) which handles the actual Storage
+ * upload and jobs-table update on its side. This service holds NO Supabase
+ * credentials at all - Lovable Cloud does not expose the service-role key to
+ * outside services, so the edge function does that part internally.
  *
  * Request body shape expected from the Supabase Edge Function:
  * {
@@ -41,7 +42,7 @@ const { v4: uuidv4 } = require('uuid');
 
 const { processImage } = require('./processImage');
 const { processVideo } = require('./processVideo');
-const { uploadResultFile, updateJob, markJobFailed } = require('./supabaseClient');
+const { reportSuccess, reportFailure } = require('./callbackClient');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -91,11 +92,11 @@ app.post('/apply-blur', requireServiceSecret, async (req, res) => {
   res.status(202).json({ status: 'accepted', job_id });
 
   // Run the job in the background. Any error here is caught and reported
-  // back to Supabase via markJobFailed so the job never gets stuck silently
-  // in "processing" forever.
+  // back to the edge function via reportFailure so the job never gets stuck
+  // silently in "processing" forever.
   runJob(body).catch(async (err) => {
     console.error(`Job ${job_id} failed:`, err);
-    await markJobFailed(job_id, err.message || String(err));
+    await reportFailure({ jobId: job_id, errorMessage: err.message || String(err) });
   });
 });
 
@@ -111,7 +112,7 @@ async function runJob(body) {
 
   try {
     let localOutputPath;
-    let storagePath;
+    let fileName;
     let contentType;
 
     if (file_type === 'image') {
@@ -122,7 +123,7 @@ async function runJob(body) {
         outputPath: localOutputPath,
         blurOpts,
       });
-      storagePath = `${job_id}/output.png`;
+      fileName = 'output.png';
       contentType = 'image/png';
     } else {
       // video
@@ -135,18 +136,21 @@ async function runJob(body) {
         workDir,
         blurOpts,
       });
-      storagePath = `${job_id}/output.mp4`;
+      fileName = 'output.mp4';
       contentType = 'video/mp4';
     }
 
-    await uploadResultFile(localOutputPath, storagePath, contentType);
-
-    await updateJob(job_id, {
-      status: 'complete',
-      result_file_url: storagePath,
+    // Hand the finished file to the edge function - IT does the Storage
+    // upload and jobs-table update, since it has the service-role key and
+    // this service deliberately does not.
+    await reportSuccess({
+      jobId: job_id,
+      localFilePath: localOutputPath,
+      fileName,
+      contentType,
     });
 
-    console.log(`Job ${job_id} completed successfully -> ${storagePath}`);
+    console.log(`Job ${job_id} completed successfully and was handed off to the callback`);
   } finally {
     // Always clean up the scratch directory for this job, success or failure,
     // so disk usage doesn't grow unbounded across many jobs.
