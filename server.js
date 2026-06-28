@@ -8,17 +8,20 @@
  *
  * Design: this endpoint responds 202 Accepted immediately after validating
  * the request, then does the actual (slow) frame extraction / blur / re-encode
- * work in the background. When finished, it POSTs the finished file to a
- * Supabase Edge Function (CALLBACK_URL) which handles the actual Storage
- * upload and jobs-table update on its side. This service holds NO Supabase
- * credentials at all - Lovable Cloud does not expose the service-role key to
- * outside services, so the edge function does that part internally.
+ * work in the background. When finished, it POSTs the finished file to
+ * whichever URL was given as `callback_url` in the request body - a Supabase
+ * Edge Function that handles the actual Storage upload and jobs-table update
+ * on its side. This service holds NO Supabase credentials and no fixed
+ * callback URL setting at all: Lovable's edge functions compute the right
+ * callback URL per-request and include it in the job payload, so Railway
+ * never needs to know the Supabase project URL.
  *
  * Request body shape expected from the Supabase Edge Function:
  * {
  *   "job_id": "uuid",
  *   "file_type": "image" | "video",
  *   "source_url": "https://...",      // signed URL to original file
+ *   "callback_url": "https://...",    // where to POST the finished result
  *   "blur_strength": 35,               // optional, default 35
  *   "feather_pixels": 8,               // optional, default 8
  *
@@ -70,11 +73,13 @@ app.get('/health', (req, res) => {
 
 app.post('/apply-blur', requireServiceSecret, async (req, res) => {
   const body = req.body || {};
-  const { job_id, file_type, source_url } = body;
+  const { job_id, file_type, source_url, callback_url } = body;
 
   // --- Validate the request shape before accepting the job ---
-  if (!job_id || !file_type || !source_url) {
-    return res.status(400).json({ error: 'job_id, file_type, and source_url are required' });
+  if (!job_id || !file_type || !source_url || !callback_url) {
+    return res.status(400).json({
+      error: 'job_id, file_type, source_url, and callback_url are required',
+    });
   }
   if (file_type !== 'image' && file_type !== 'video') {
     return res.status(400).json({ error: 'file_type must be "image" or "video"' });
@@ -92,16 +97,16 @@ app.post('/apply-blur', requireServiceSecret, async (req, res) => {
   res.status(202).json({ status: 'accepted', job_id });
 
   // Run the job in the background. Any error here is caught and reported
-  // back to the edge function via reportFailure so the job never gets stuck
+  // back to callback_url via reportFailure so the job never gets stuck
   // silently in "processing" forever.
   runJob(body).catch(async (err) => {
     console.error(`Job ${job_id} failed:`, err);
-    await reportFailure({ jobId: job_id, errorMessage: err.message || String(err) });
+    await reportFailure({ callbackUrl: callback_url, jobId: job_id, errorMessage: err.message || String(err) });
   });
 });
 
 async function runJob(body) {
-  const { job_id, file_type, source_url, mask_url, frame_masks } = body;
+  const { job_id, file_type, source_url, mask_url, frame_masks, callback_url } = body;
   const blurOpts = {
     blurStrength: body.blur_strength ?? 35,
     featherPixels: body.feather_pixels ?? 8,
@@ -140,10 +145,11 @@ async function runJob(body) {
       contentType = 'video/mp4';
     }
 
-    // Hand the finished file to the edge function - IT does the Storage
-    // upload and jobs-table update, since it has the service-role key and
-    // this service deliberately does not.
+    // Hand the finished file to the callback URL given in this job's
+    // payload - IT does the Storage upload and jobs-table update, since it
+    // has the service-role key and this service deliberately does not.
     await reportSuccess({
+      callbackUrl: callback_url,
       jobId: job_id,
       localFilePath: localOutputPath,
       fileName,
